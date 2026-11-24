@@ -1,6 +1,6 @@
 pluginManagement {
     repositories {
-        google()
+        google() // Ưu tiên máy chủ Google
         mavenCentral()
         gradlePluginPortal()
     }
@@ -8,8 +8,9 @@ pluginManagement {
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
-        google()
+        google() // Ưu tiên máy chủ Google
         mavenCentral()
+        maven { url 'https://jitpack.io' }
     }
 }
 rootProject.name = "NOA-Overlay"
