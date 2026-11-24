@@ -20,7 +20,6 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
@@ -42,70 +41,110 @@ import java.util.concurrent.TimeUnit
 class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
-    private lateinit var noaView: View
+    private var noaView: View? = null // Có thể null vì nó sẽ biến mất
     private lateinit var layoutParams: WindowManager.LayoutParams
-    private lateinit var noaText: TextView
+    private var noaText: TextView? = null
+    
     private var speechRecognizer: SpeechRecognizer? = null
     private lateinit var recognizerIntent: Intent
-    private var isListening = false
     private var isProcessing = false
     private var isWaitingForCommand = false
+    private var isViewShowing = false // Cờ kiểm tra vòng tròn đang hiện hay ẩn
+    private var isListening = false
+
     private lateinit var tts: TextToSpeech
-    private var isTtsSpeaking = false
     private val client = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).readTimeout(10, TimeUnit.SECONDS).build()
+    
     private val GEMINI_API_KEY = "AQ.Ab8RN6K1hP_NDKFQ-m65lrW4R1Jq8HG1PC0LG-G-MbbdEecEEg"
     private val handler = Handler(Looper.getMainLooper())
-    private var restartRunnable: Runnable? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         startForeground(1, buildNotification())
+        
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "NOA::WakeLock")
         wakeLock?.acquire()
+
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        initOverlay()
+        
+        // Chuẩn bị sẵn LayoutParams nhưng CHƯA vẽ lên màn hình
+        val flag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
+        layoutParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT, 
+            WindowManager.LayoutParams.WRAP_CONTENT, 
+            flag, 
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, 
+            PixelFormat.TRANSLUCENT
+        )
+        layoutParams.gravity = Gravity.TOP or Gravity.START
+        layoutParams.x = 100
+        layoutParams.y = 100 // Vị trí mặc định khi hiện lên (có thể kéo đi)
+
         initTTS()
         initSpeech()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
-    private fun initOverlay() {
+    // HÀM HIỂN THỊ (Giống Dynamic Island bật ra)
+    private fun showView() {
+        if (isViewShowing) return
         noaView = LayoutInflater.from(this).inflate(R.layout.overlay_noa, null)
-        noaText = noaView.findViewById(R.id.noa_text)
-        val flag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
-        layoutParams = WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, flag, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT)
-        layoutParams.gravity = Gravity.TOP or Gravity.START
-        layoutParams.x = 100; layoutParams.y = 100
+        noaText = noaView?.findViewById(R.id.noa_text)
+        
         windowManager.addView(noaView, layoutParams)
+        isViewShowing = true
 
         val rotate = RotateAnimation(0f, 360f, Animation.RELATIVE_TO_SELF, 0.5f, Animation.RELATIVE_TO_SELF, 0.5f)
         rotate.duration = 4000; rotate.repeatCount = Animation.INFINITE; rotate.interpolator = LinearInterpolator()
-        noaView.findViewById<View>(R.id.noa_ring).startAnimation(rotate)
+        noaView?.findViewById<View>(R.id.noa_ring)?.startAnimation(rotate)
 
-        noaView.setOnTouchListener(object : View.OnTouchListener {
+        // Bắt sự kiện kéo thả
+        noaView?.setOnTouchListener(object : View.OnTouchListener {
             private var initialX = 0; private var initialY = 0
             private var initialTouchX = 0f; private var initialTouchY = 0f
+            private var isDragging = false
+
             override fun onTouch(v: View?, event: MotionEvent?): Boolean {
                 when (event?.action) {
                     MotionEvent.ACTION_DOWN -> {
                         initialX = layoutParams.x; initialY = layoutParams.y
                         initialTouchX = event.rawX; initialTouchY = event.rawY
-                        return true
+                        isDragging = false
+                        return false
                     }
                     MotionEvent.ACTION_MOVE -> {
-                        layoutParams.x = initialX + (event.rawX - initialTouchX).toInt()
-                        layoutParams.y = initialY + (event.rawY - initialTouchY).toInt()
-                        windowManager.updateViewLayout(noaView, layoutParams)
+                        val dx = Math.abs(event.rawX - initialTouchX)
+                        val dy = Math.abs(event.rawY - initialTouchY)
+                        if (dx > 10 || dy > 10) {
+                            isDragging = true
+                            layoutParams.x = initialX + (event.rawX - initialTouchX).toInt()
+                            layoutParams.y = initialY + (event.rawY - initialTouchY).toInt()
+                            noaView?.let { windowManager.updateViewLayout(it, layoutParams) }
+                        }
                         return true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        return isDragging
                     }
                 }
                 return false
             }
         })
+    }
+
+    // HÀM ẨN ĐI (Giống Dynamic Island thu nhỏ lại)
+    private fun hideView() {
+        if (!isViewShowing) return
+        try {
+            noaView?.let { windowManager.removeView(it) }
+            noaView = null
+            noaText = null
+            isViewShowing = false
+        } catch (e: Exception) {}
     }
 
     private fun initTTS() {
@@ -114,20 +153,6 @@ class OverlayService : Service() {
                 tts.language = Locale("vi", "VN")
             }
         }
-        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {
-                isTtsSpeaking = true
-                speechRecognizer?.stopListening()
-            }
-            override fun onDone(utteranceId: String?) {
-                isTtsSpeaking = false
-                if (!isProcessing) scheduleRestart(1000)
-            }
-            override fun onError(utteranceId: String?) {
-                isTtsSpeaking = false
-                if (!isProcessing) scheduleRestart(1000)
-            }
-        })
     }
 
     private fun initSpeech() {
@@ -144,21 +169,26 @@ class OverlayService : Service() {
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
             override fun onEndOfSpeech() {}
+            
             override fun onError(error: Int) {
                 isListening = false
-                scheduleRestart(2000)
+                if (!isProcessing) {
+                    scheduleRestart(2000)
+                }
             }
+
             override fun onResults(results: Bundle?) {
                 isListening = false
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 if (!matches.isNullOrEmpty()) {
                     val text = matches[0].lowercase()
+                    
                     if (isWaitingForCommand) {
                         isWaitingForCommand = false
                         processCommand(text)
                     } else if (isProcessing) {
                         processCommand(text)
-                    } else if (text.contains("nô a") || text.contains("nô ạ")) {
+                    } else if (text.contains("nô a") || text.contains("nô ạ") || text.contains("nô a ơi")) {
                         wakeUp()
                     } else {
                         scheduleRestart(2000)
@@ -167,6 +197,7 @@ class OverlayService : Service() {
                     scheduleRestart(2000)
                 }
             }
+
             override fun onPartialResults(partialResults: Bundle?) {}
             override fun onEvent(eventType: Int, params: Bundle?) {}
         })
@@ -174,15 +205,13 @@ class OverlayService : Service() {
     }
 
     private fun scheduleRestart(delay: Long) {
-        if (!isProcessing && !isTtsSpeaking) {
-            restartRunnable?.let { handler.removeCallbacks(it) }
-            restartRunnable = Runnable { startListening() }
-            handler.postDelayed(restartRunnable!!, delay)
+        if (!isProcessing) {
+            handler.postDelayed({ startListening() }, delay)
         }
     }
 
     private fun startListening() {
-        if (!isListening && !isProcessing && !isTtsSpeaking) {
+        if (!isListening && !isProcessing && speechRecognizer != null) {
             try {
                 isListening = true
                 speechRecognizer?.startListening(recognizerIntent)
@@ -192,24 +221,39 @@ class OverlayService : Service() {
         }
     }
 
+    // KHI NGHE THẤY TỪ KHÓA "NÔ A"
     private fun wakeUp() {
         isProcessing = true
         isWaitingForCommand = true
         handler.removeCallbacksAndMessages(null)
-        noaText.text = "DẠ"
-        noaText.setTextColor(Color.WHITE)
-        noaView.setBackgroundColor(Color.parseColor("#5500D4FF"))
+        
+        // 1. HIỆN VÒNG TRÒN LÊN
+        showView()
+        noaText?.text = "DẠ"
+        noaText?.setTextColor(Color.WHITE)
+        noaView?.setBackgroundColor(Color.parseColor("#5500D4FF"))
+        
+        // 2. NÓI "DẠ"
         tts.speak("Dạ, tôi nghe đây", TextToSpeech.QUEUE_FLUSH, null, "wake")
+        
+        // 3. ĐỢI 2.5S ĐỂ NGHE LỆNH
         handler.postDelayed({
             isWaitingForCommand = false
             isProcessing = false
-            scheduleRestart(1000)
+            startListening()
         }, 2500)
     }
 
     private fun processCommand(command: String) {
-        noaText.text = "XỬ LÝ..."
-        noaView.setBackgroundColor(Color.parseColor("#55FFA500"))
+        noaText?.text = "XỬ LÝ..."
+        noaView?.setBackgroundColor(Color.parseColor("#55FFA500"))
+        
+        // Nếu bạn nói "tắt", nó sẽ ẩn đi và ngủ
+        if (command.contains("tắt") || command.contains("biến đi") || command.contains("ngủ")) {
+            respondToUser("Dạ, tôi ngủ đây.")
+            return
+        }
+        
         if (command.startsWith("gọi cho") || command.startsWith("gọi điện cho")) {
             val name = command.replace("gọi cho", "").replace("gọi điện cho", "").trim()
             makeCall(name)
@@ -290,18 +334,24 @@ class OverlayService : Service() {
 
     private fun respondToUser(text: String) {
         handler.post {
-            noaText.text = "N O A"
-            noaText.setTextColor(Color.parseColor("#00FFFF"))
-            noaView.setBackgroundColor(Color.TRANSPARENT)
+            noaText?.text = "N O A"
+            noaText?.setTextColor(Color.parseColor("#00FFFF"))
+            noaView?.setBackgroundColor(Color.TRANSPARENT)
+            
             tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "respond")
+            
+            // ĐỢI NÓI XONG THÌ BIẾN MẤT VÀO HƯ KHÔNG
             isProcessing = false
-            scheduleRestart(2000)
+            handler.postDelayed({
+                hideView() // Ẩn vòng tròn đi
+                startListening() // Bật lại mic nghe ngầm
+            }, 4000) 
         }
     }
 
     private fun buildNotification(): Notification {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, "noa_channel").setContentTitle("NOA Assistant").setContentText("Đang lắng nghe...").setSmallIcon(android.R.drawable.ic_menu_compass).build()
+            Notification.Builder(this, "noa_channel").setContentTitle("NOA Assistant").setContentText("Đang chạy ngầm...").setSmallIcon(android.R.drawable.ic_menu_compass).build()
         } else {
             Notification.Builder(this).setContentTitle("NOA Assistant").setSmallIcon(android.R.drawable.ic_menu_compass).build()
         }
@@ -318,7 +368,7 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        if (::noaView.isInitialized) windowManager.removeView(noaView)
+        hideView() // Xóa view khi service chết
         try { speechRecognizer?.destroy() } catch (e: Exception) {}
         tts.stop(); tts.shutdown()
         handler.removeCallbacksAndMessages(null)
